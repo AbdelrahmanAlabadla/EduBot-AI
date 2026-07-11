@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+*.so
+.pytest_cache/
+*.egg-info/
+
+# Virtual environment
+.venv/
+env/
+venv/
+.env/
+
+# IDE - PyCharm
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Logs & test outputs
+*.log
+testoutput.txt
+
+# Environment variables
+backend/.env
+.env.local
+.env.*.local
+
+# Database / Alembic
+*.db
+*.sqlite
+
+# Node (if used in frontend)
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+frontend/.next/
