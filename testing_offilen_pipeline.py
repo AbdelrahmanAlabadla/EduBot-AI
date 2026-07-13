@@ -61,7 +61,7 @@ def main():
                 traceback.print_exc(file=out)
             out.write("\n")
 
-    print(f"Done. Output saved to {output_path}")
+        print(f"Done. Output saved to {output_path}")
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 ALLOWED_EXTENSIONS = {f".{ext}" for ext in settings.ALLOWED_FILE_TYPES}
 
 
-def validate_file(file_path: str | Path) -> Path:
+def _validate_file(file_path: str | Path) -> Path:
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
@@ -24,7 +24,7 @@ def validate_file(file_path: str | Path) -> Path:
 
 
 def ingest_file(file_path: str | Path) -> List[Document]:
-    path = validate_file(file_path)
+    path = _validate_file(file_path)
     logger.info("Ingesting file with LlamaParse: %s", path.name)
 
     loader = LlamaParse(
