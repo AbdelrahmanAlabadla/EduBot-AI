@@ -1,16 +1,22 @@
 import logging
-from typing import List, Optional
-from uuid import UUID
+from typing import List, Optional, Dict
+from uuid import UUID, uuid4
 
 from langchain_core.documents import Document
-from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
+from qdrant_client.http.models import (
+    PointStruct,
+    VectorParams,
+    SparseVectorParams,
+    SparseIndexParams,
+    Distance,
+    HnswConfigDiff,
+)
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.pipeline.offline_phase.chunking import SEARCHABLE_TYPES, CONTEXT_TYPES
-from app.pipeline.offline_phase.embedding import _get_embedder
 
 logger = logging.getLogger(__name__)
 
@@ -42,13 +48,21 @@ def _ensure_collection(school_id: UUID | str):
     try:
         client.get_collection(name)
     except (UnexpectedResponse, ValueError):
-        logger.info("Creating Qdrant collection: %s", name)
+        logger.info("Creating Qdrant collection (dense + sparse): %s", name)
         client.create_collection(
             collection_name=name,
             vectors_config={
-                "size": 1024,
-                "distance": "Cosine",
+                "": VectorParams(size=1024, distance=Distance.COSINE),
             },
+            sparse_vectors_config={
+                "sparse": SparseVectorParams(
+                    index=SparseIndexParams(),
+                ),
+            },
+            hnsw_config=HnswConfigDiff(
+                payload_m=16,
+                m=0,
+            ),
         )
 
 
@@ -75,22 +89,37 @@ def store_in_qdrant(
     _validate_schema(to_store)
     _ensure_collection(school_id)
 
-    embedder = _get_embedder()
     client = _get_client()
     name = _collection_name(school_id)
 
-    vector_store = QdrantVectorStore(
-        client=client,
-        collection_name=name,
-        embedding=embedder,
-    )
+    points = []
+    for chunk in to_store:
+        meta = chunk.metadata
+        dense = meta.get("embedding")
+        sparse = meta.get("sparse_vector")
+        if dense is None:
+            logger.warning("Chunk missing embedding, skipping upsert: %.60s", chunk.page_content)
+            continue
 
-    texts = [c.page_content for c in to_store]
-    metadatas = [c.metadata for c in to_store]
+        vectors: Dict = {"": dense}
+        if sparse:
+            vectors["sparse"] = sparse
 
-    logger.info("Upserting %d chunks into Qdrant collection: %s", len(to_store), name)
-    vector_store.add_texts(texts=texts, metadatas=metadatas)
-    logger.info("Qdrant upsert complete.")
+        payload = {k: v for k, v in meta.items() if k not in ("embedding", "sparse_vector")}
+        payload["page_content"] = chunk.page_content
+
+        points.append(PointStruct(
+            id=meta.get("qdrant_point_id") or str(uuid4()),
+            vector=vectors,
+            payload=payload,
+        ))
+
+    if points:
+        logger.info("Upserting %d points into Qdrant collection: %s", len(points), name)
+        client.upsert(collection_name=name, points=points)
+        logger.info("Qdrant upsert complete.")
+    else:
+        logger.info("No valid points to upsert.")
 
     if db:
         _save_parents_to_postgres(chunks, db)

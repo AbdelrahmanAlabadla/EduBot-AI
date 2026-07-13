@@ -15,6 +15,36 @@ class Settings(BaseSettings):
     QDRANT_HOST: str = "localhost"
     QDRANT_PORT: int = 6333
 
+    # LLM (LM Studio)
+    LLM_BASE_URL: str = "http://127.0.0.1:1234/api/v1"
+    LLM_MODEL: str = "mistralai/ministral-3-3b"
+    RAG_MODEL: str = "mistralai/ministral-3-3b"
+    LLM_MAX_TOKENS: int = 4000
+
+    # RAG
+    RAG_DENSE_LIMIT: int = 20
+    RAG_SPARSE_LIMIT: int = 20
+    RAG_FINAL_K: int = 5
+    RAG_SCORE_THRESHOLD: float = 0.3  # set >0 to filter low-relevance chunks (see rerank score logs)
+    RERANKER_MODEL: str = "BAAI/bge-reranker-v2-m3"
+
+    # Fallback message (global default, per-tenant overrides in chatbot_settings)
+    FALLBACK_MESSAGE_EN: str = "I'm sorry, I couldn't find enough information to answer your question. Please try rephrasing or contact the school directly."
+    FALLBACK_MESSAGE_AR: str = "عذرًا، لم أتمكن من العثور على معلومات كافية للإجابة على سؤالك. يرجى إعادة صياغة السؤال أو التواصل مع المدرسة مباشرة."
+
+    # Verification note (appended when Tier 2 flags unsubstantiated numbers)
+    VERIFICATION_NOTE_EN: str = "\n\n---\n*Please verify the specific numbers, fees, and deadlines mentioned above with the relevant office for the most accurate and up-to-date information.*"
+    VERIFICATION_NOTE_AR: str = "\n\n---\n*يرجى التحقق من الأرقام والرسوم والمواعيد النهائية المذكورة أعلاه مع الجهة المختصة للحصول على أدق وأحدث المعلومات.*"
+
+    # University info (name is shown in bot responses)
+    UNIVERSITY_NAME: str = "the university"
+    CONTACT_EMAIL: str = ""
+    CONTACT_PHONE: str = ""
+
+    # Query rewrite history limits
+    REWRITE_MAX_HISTORY_CHARS: int = 2000
+    REWRITE_MAX_TURN_CHARS: int = 400
+
     class Config:
         env_file = str(Path(__file__).resolve().parents[2] / ".env")
         env_file_encoding = "utf-8"

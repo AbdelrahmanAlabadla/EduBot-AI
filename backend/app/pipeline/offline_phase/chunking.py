@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 TOKENIZER = AutoTokenizer.from_pretrained("BAAI/bge-m3")
 CHILD_MIN_TOKENS = 250
-CHILD_MAX_TOKENS = 400
+CHILD_MAX_TOKENS = 600
 
 HEADING_SPLIT_PATTERN = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
 FAQ_Q_PATTERN = re.compile(r"^\*{0,2}Q\s*[:：]\s*(.+)$", re.IGNORECASE | re.MULTILINE)
@@ -20,7 +20,7 @@ FAQ_A_PATTERN = re.compile(r"^\*{0,2}A\s*[:：]\s*(.+)$", re.IGNORECASE | re.MUL
 SECTION_NUM_PATTERN = re.compile(r"^(\d+(?:\.\d+)*)\s*[\.\)\-]\s+")
 
 # Chunk-type constants shared across the pipeline
-SEARCHABLE_TYPES = {"child", "single"}
+SEARCHABLE_TYPES = {"child", "single", "table"}
 CONTEXT_TYPES = {"parent", "single"}
 
 # Hardcoded boilerplate blocklist — low false-positive, always-on

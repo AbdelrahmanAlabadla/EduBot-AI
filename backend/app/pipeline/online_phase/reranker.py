@@ -1,0 +1,113 @@
+import logging
+import math
+import re
+from typing import List, Dict, Any, Optional
+
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+_HTML_ENTITY_RE = re.compile(r'&#\d+;|&[a-zA-Z]+;')
+
+
+def _clean_text(text: str) -> str:
+    text = _HTML_ENTITY_RE.sub(' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+_reranker = None
+
+
+def _get_reranker():
+    global _reranker
+    if _reranker is None:
+        logger.info("Loading cross-encoder reranker: %s", settings.RERANKER_MODEL)
+        from FlagEmbedding import FlagReranker
+        _reranker = FlagReranker(
+            settings.RERANKER_MODEL,
+            use_fp16=False,
+        )
+        logger.info("Reranker loaded.")
+    return _reranker
+
+
+def initial_judge(
+    chunks: List[Dict[str, Any]],
+    query: str,
+    min_rrf_score: float = 0.0001,
+) -> bool:
+    if not chunks:
+        logger.info("Initial judge: no chunks retrieved — pipeline should halt")
+        return False
+
+    top_score = chunks[0].get("score", 0)
+    if top_score < min_rrf_score:
+        logger.info("Initial judge: top RRF score %.4f below min %.4f — halting", top_score, min_rrf_score)
+        return False
+
+    if top_score < 0.01:
+        logger.warning("Initial judge: top RRF score is very low (%.4f) — answer quality may suffer", top_score)
+
+    logger.info("Initial judge: %d chunks retrieved, top RRF score=%.4f for query: %.80s", len(chunks), top_score, query)
+    return True
+
+
+def rerank_and_filter(
+    chunks: List[Dict[str, Any]],
+    query: str,
+    top_k: int = None,
+    score_threshold: float = None,
+) -> List[Dict[str, Any]]:
+    if top_k is None:
+        top_k = settings.RAG_FINAL_K
+    if score_threshold is None:
+        score_threshold = settings.RAG_SCORE_THRESHOLD
+
+    if not chunks:
+        return []
+
+    reranker = _get_reranker()
+
+    pairs = []
+    for chunk in chunks:
+        text = chunk.get("full_context") or chunk.get("payload", {}).get("page_content", "")
+        text = _clean_text(text)
+        pairs.append([query, text])
+
+    logger.info("Reranking %d chunks with cross-encoder...", len(pairs))
+
+    normalized = []
+    try:
+        raw_scores = reranker.compute_score(pairs, normalize=False)
+    except Exception as e:
+        logger.warning("Cross-encoder compute_score failed: %s — falling back to RRF scores", e)
+        raw_scores = None
+
+    if raw_scores and len(raw_scores) == len(chunks):
+        raw_min, raw_max = min(raw_scores), max(raw_scores)
+        sigmoid = [1.0 / (1.0 + math.exp(-s)) for s in raw_scores]
+        sig_min, sig_max = min(sigmoid), max(sigmoid)
+        if sig_max > sig_min:
+            normalized = [(s - sig_min) / (sig_max - sig_min) for s in sigmoid]
+        else:
+            normalized = [1.0] * len(sigmoid)
+        norm_min, norm_max = min(normalized), max(normalized)
+        logger.info("Rerank raw logits: min=%.4f  max=%.4f  |  sigmoid: min=%.4f  max=%.4f  |  normed: min=%.4f  max=%.4f  (threshold=%.2f)",
+                     raw_min, raw_max, sig_min, sig_max, norm_min, norm_max, score_threshold)
+    else:
+        logger.warning("Cross-encoder returned no valid scores — falling back to RRF scores for ordering")
+        normalized = [chunk.get("score", 0) for chunk in chunks]
+
+    scored = list(zip(chunks, normalized))
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    filtered = []
+    for chunk, score in scored:
+        chunk["rerank_score"] = float(score)
+        if score >= score_threshold:
+            filtered.append(chunk)
+
+    kept = filtered[:top_k]
+    logger.info("Rerank: kept %d / %d chunks (threshold=%.2f)", len(kept), len(chunks), score_threshold)
+
+    return kept
