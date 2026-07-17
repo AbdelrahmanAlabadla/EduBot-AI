@@ -16,13 +16,15 @@ def rrf_search(
     query: str,
     dense_limit: int = None,
     sparse_limit: int = None,
-    final_limit: int = 20,
+    final_limit: int = None,
     score_threshold: float = 0.0,
 ) -> List[Dict[str, Any]]:
     if dense_limit is None:
         dense_limit = settings.RAG_DENSE_LIMIT
     if sparse_limit is None:
         sparse_limit = settings.RAG_SPARSE_LIMIT
+    if final_limit is None:
+        final_limit = settings.RAG_RRF_LIMIT
 
     dense_vec, sparse_vec = embed_query(query)
 

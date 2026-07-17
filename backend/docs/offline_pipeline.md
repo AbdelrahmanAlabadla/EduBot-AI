@@ -2,12 +2,12 @@
 
 ## Overview
 
-The offline pipeline processes uploaded documents (PDF, DOCX, TXT, HTML) through a 6-stage pipeline: ingestion, parsing, normalization, chunking, embedding, and Qdrant storage. Uses LlamaParse + spaCy + BGE-M3 + Qdrant with LangChain Documents throughout.
+The offline pipeline processes uploaded documents (PDF, DOCX, TXT, HTML) through a 7-stage pipeline: ingestion, parsing, normalization, chunking, summarization, embedding, and Qdrant storage. Uses LlamaParse + spaCy + BGE-M3 + Qdrant with LangChain Documents throughout.
 
 ## Pipeline Stages
 
 ```
-ingestion  →  parser  →  clean_norm  →  chunking  →  embedding  →  qdrant
+ingestion  →  parser  →  clean_norm  →  chunking  →  summarizer  →  embedding  →  qdrant
 ```
 
 ### 1. Ingestion (`ingestion.py`)
@@ -31,46 +31,79 @@ Runs in this order:
 
 **Step 3 — Whitespace normalization:** Collapses excessive newlines, trailing whitespace, multiple spaces.
 
-### 4. Chunking (`chunking.py`)
+### 4. Chunking (`chunking.py`) — v2 (Hierarchical + Semantic)
 
-Receives `"raw_markdown"` blocks (whole pages). Uses `re.split` on `^(#+)\s+(.+)` across the full page text (not line-by-line) to split by headings. Heading stack persists across pages so breadcrumbs are correct even when a heading is on a previous page. Classifies each section as table, FAQ, or prose using inline pattern matching.
+Receives `"raw_markdown"` blocks (whole pages). The chunker now builds a **heading hierarchy tree** dynamically (any depth), then resolves parent sections and classifies leaves by content type.
 
-Three chunk sizes:
+**Tree building:**
+- All pages' sections are parsed via regex `^(#+)\s+(.+)` and merged into a single tree
+- Heading stack persists across pages for correct breadcrumbs
+- Orphan level-0 continuations (text on a new page after a heading) are merged back into the previous heading's content
 
-| Token count | Chunk(s) produced | Why |
-|---|---|---|
-| ≤250 | `single` | Too small to split |
-| 251–400 | `parent` only | Parent fits within CHILD_MAX_TOKENS, so no redundant child copy |
-| 401–1500 | `parent` + 1+ `child` | Parent stored in Postgres (LLM context), children embedded for search |
-| >1500 | `parent` + multiple `child` | Multiple sentence-boundary splits with last-sentence overlap |
+**Parent resolution:**
+- A heading becomes a `parent` chunk only if its subtree contains **>1 leaf** (content block)
+- Leaves point to their nearest parent ancestor via `parent_id`
+- Sub-parents link to their grandparent via `parent_id` for future escalation use (currently unused)
+
+**Content-type branching (runs before any splitting):**
+
+| Content type | Behavior |
+|---|---|
+| **Table** | Atomic — one table = one chunk, never split by rows. `searchable_text` via `_table_to_sentence()` for embedding. |
+| **FAQ** | Atomic — one Q&A pair = one chunk. |
+
+**Prose sizing:**
+
+| Token count | Chunk(s) produced |
+|---|---|
+| ≤600 | `single` chunk (with `parent_id` if under a >1-leaf heading) |
+| >600 | `parent` chunk + multiple `child` chunks (semantically split) |
+
+**Semantic splitting (replaces sentence-boundary token split):**
+- Embeds each sentence via **BGE-M3** (same model used for retrieval embeddings)
+- Computes cosine similarity between consecutive sentence embeddings
+- Break threshold: **0.70** — similarity below 0.70 marks a topic-shift boundary
+- Respects `CHILD_MIN_TOKENS` (250) / `CHILD_MAX_TOKENS` (600) so breakpoints don't produce tiny or oversized chunks
+- Overlap: last 2 sentences from each child are prepended to the next child
+- BGE-M3 model is loaded only when needed and released after chunking
 
 **Chunk types:**
 | Type | Purpose | Stored in | Embedded for search |
 |---|---|---|---|
-| `single` | Short block (≤250 tokens) | Postgres + Qdrant | ✅ |
-| `parent` | Full section | Postgres only | ❌ (LLM context) |
-| `child` | Sub-split (250-400 tokens) | Postgres + Qdrant | ✅ |
-| `table` | Atomic table, never split | Postgres + Qdrant | ✅ (via `searchable_text`) |
-| `faq` | 1 Q&A pair = 1 chunk | Postgres + Qdrant | ✅ (via `searchable_text`) |
+| `single` | Short block (≤600 tokens) | Postgres + Qdrant | ✅ |
+| `parent` | Full section text (for LLM context, never embedded) | Postgres only | ❌ |
+| `child` | Semantic sub-split (>600 token prose sections) | Qdrant only | ✅ |
+| `table` | Atomic table, never split | Qdrant only | ✅ (via `searchable_text`) |
+| `faq` | 1 Q&A pair = 1 chunk | Qdrant only | ✅ (via `searchable_text`) |
+| `summary` | 3-4 sentence LLM-generated summary | Qdrant only | ✅ |
 
-**Sentence-boundary splitting:** Uses spaCy's `xx_sent_ud_sm` sentencizer. Last sentence of each child is prepended as overlap to the next child for context continuity.
+**Post-processing:**
+- Boilerplate detection + removal (same as v1)
+- **Preamble-drop:** root-level orphan fragments (<25 tokens, no breadcrumb) are **dropped** instead of merged into neighbouring sections (prevents metadata text like "Effective Date" from polluting heading content embeddings)
+- Small fragments merged forward/backward (same as v1)
+- Orphan fragments dropped (same as v1)
 
-**Overlap example:**
-```
-Chunk A: "Tuition fees are paid by credit card. Refunds are processed within 30 days."
-                                              ↑ last sentence → overlap
-Chunk B: "Refunds are processed within 30 days. Late payments incur a 5% fee."
-         ↑ same sentence — context bridge between chunks
-```
+### 4a. Summarization (`summarizer.py`)
+
+- Runs immediately after chunking, before embedding
+- For each `parent` chunk, sends the full section text to **LM Studio** (3 concurrent calls via `ThreadPoolExecutor`)
+- Prompt is guided: extracts named requirements, numbers, deadlines, fees, etc. — avoids generic filler
+- Returns `summary` chunk type with breadcrumb prepended to embedded text
+- Summary chunks go into the same Qdrant collection as child/table/faq chunks — one merged pool, similarity sorting determines which type wins per query
 
 ### 5. Embedding (`embedding.py`)
-- `BAAI/bge-m3` via `sentence-transformers` — multilingual (Arabic, English, French, etc.)
-- Embeds `"child"` and `"single"` chunk types
+- `BAAI/bge-m3` via `BGEM3FlagModel` — multilingual (Arabic, English, French, etc.)
+- Embeds all `SEARCHABLE_TYPES` = `{"child", "single", "table", "summary"}`
+- **Breadcrumb prepending:** for `child` and `summary` chunks, the breadcrumb path is prepended to the embedded text (e.g. `"Admissions Policy > Undergraduate > Eligibility Requirements: ..."`) so dense retrieval doesn't lose section context
+- `table` chunks embed via `searchable_text` (natural language sentence conversion)
+- `faq` chunks embed via `searchable_text` (Q/A concatenated)
 
 ### 6. Qdrant Storage (`qdrant.py`)
 - One Qdrant collection per school: `school_{school_id}`
 - Schema conformance check before upsert
-- `"parent"` chunks stored in Postgres for LLM context
+- `"parent"` and `"single"` chunks stored in Postgres for LLM context
+- All other searchable types (`child`, `table`, `faq`, `summary`) stored in Qdrant only
+- `document_version` and `effective_date` included in Qdrant payload and Postgres metadata for filterable query-time use
 
 ## Chunk Metadata Schema
 
@@ -79,7 +112,7 @@ Every chunk is a LangChain `Document` with:
 {
     "page_content": "Scope\n\nThis policy applies to all students...",
     "metadata": {
-        "chunk_type": "single" | "parent" | "child" | "table" | "faq",
+        "chunk_type": "single" | "parent" | "child" | "table" | "faq" | "summary",
         "breadcrumb": "Undergraduate > International > Required Documents",
         "parent_id": UUID | None,
         "document_id": UUID,
@@ -87,8 +120,10 @@ Every chunk is a LangChain `Document` with:
         "chunk_order": int,
         "page_number": int | None,
         "source_file": str | None,
-        "searchable_text": str | None,
-        "embedding": List[float] | None,
+        "searchable_text": str | None,                # table/faq only
+        "document_version": str | None,               # e.g. "3.2"
+        "effective_date": datetime | None,            # e.g. 2026-01-15
+        "embedding": List[float] | None,               # set by embedding step
     }
 }
 ```
@@ -101,7 +136,7 @@ langchain==0.3.0
 langchain-community==0.3.0
 langchain-qdrant==0.2.0
 qdrant-client==1.12.0
-sentence-transformers==3.2.0
+FlagEmbedding>=1.2.0
 transformers==4.48.0
 spacy>=3.8.0
 xx_sent_ud_sm==3.8.0
@@ -115,13 +150,12 @@ xx_sent_ud_sm==3.8.0
 | `QDRANT_HOST` | Qdrant host (default: localhost) |
 | `QDRANT_PORT` | Qdrant port (default: 6333) |
 
-## DB Migration
+## DB Migrations
 
-Migration `a1b2c3d4e5f6` adds to `document_chunks`:
-- `chunk_type` (VARCHAR 20)
-- `breadcrumb` (VARCHAR 500)
-- `parent_id` (UUID, FK→document_chunks.id)
-- `searchable_text` (TEXT)
+| Migration | Adds to `document_chunks` |
+|---|---|
+| `a1b2c3d4e5f6` | `chunk_type`, `breadcrumb`, `parent_id`, `searchable_text` |
+| `f7a8b9c0d1e2` | `document_version` (VARCHAR 50), `effective_date` (DateTime with tz) |
 
 ## File Structure
 
@@ -133,8 +167,10 @@ backend/app/pipeline/
         ingestion.py       # LlamaParse → LangChain Documents
         parser.py          # Pure extraction, no splitting
         clean_norm.py      # Structural artifacts → unicode → whitespace
-        chunking.py        # Macro split by headings, spaCy sentencizer, overlap
-        embedding.py       # BGE-M3 embedding
+        boilerplate.py     # Auto-detect boilerplate patterns across pages
+        chunking.py        # Heading tree + semantic splitting (v2)
+        summarizer.py      # LM Studio summary generation for parent sections
+        embedding.py       # BGE-M3 embedding with breadcrumb prepending
         qdrant.py          # Qdrant upsert + Postgres parent storage
         pipeline.py        # Orchestrator
 ```

@@ -1,4 +1,5 @@
 import logging
+import re
 from typing import List, Dict, Any, Optional
 from uuid import UUID, uuid4
 from datetime import datetime, timezone
@@ -6,7 +7,7 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from app.pipeline.online_phase.query_rewrite import rewrite_query
-from app.pipeline.online_phase.retrieval import hybrid_search, fetch_parent_chunks
+from app.pipeline.online_phase.retrieval import hybrid_search, expand_by_page, fetch_parent_chunks
 from app.pipeline.online_phase.reranker import initial_judge, rerank_and_filter
 from app.pipeline.online_phase.context_builder import build_context
 from app.pipeline.online_phase.generator import generate_answer
@@ -15,6 +16,7 @@ from app.models.conversation import Conversation
 from app.models.message import Message
 from app.models.analytics_event import AnalyticsEvent
 from app.models.chatbot_setting import ChatbotSetting
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -40,15 +42,32 @@ def run_online_pipeline(
     raw_chunks = hybrid_search(rewritten_query, school_id)
     logger.info("Step 2+3 done — %d raw chunks", len(raw_chunks))
 
+    # --- Step 3b: Page Expansion — fetch ALL chunks from matched pages ---
+    expanded_chunks = expand_by_page(raw_chunks, school_id)
+    logger.info("Step 3b done — %d chunks after page expansion", len(expanded_chunks))
+
     # --- Step 4: Retrieval Judge & Rerank ---
-    if not initial_judge(raw_chunks, rewritten_query):
+    if not initial_judge(expanded_chunks, rewritten_query):
         logger.info("Step 4.1 — no relevant chunks, returning fallback")
         fallback = _get_fallback_answer(detected_language, school_id, db)
         return _build_response(fallback, [], None, detected_language)
 
-    parent_chunks = fetch_parent_chunks(raw_chunks, db) if db else raw_chunks
-    final_chunks = rerank_and_filter(parent_chunks, rewritten_query)
+    parent_chunks = fetch_parent_chunks(expanded_chunks, db) if db else expanded_chunks
+
+    # Use wider top_k for broad/list-style questions
+    _list_keywords = r"list|programs?|degrees?|kinds?|types?|offered|available|what.*(?:program|degree|major|course|field|option)"
+    is_broad = bool(re.search(_list_keywords, question, re.IGNORECASE))
+    rerank_k = settings.RAG_FALLBACK_K if is_broad else settings.RAG_FINAL_K
+    if is_broad:
+        logger.info("Broad/list question detected — using top_k=%d for reranker", rerank_k)
+
+    final_chunks = rerank_and_filter(parent_chunks, rewritten_query, top_k=rerank_k)
     logger.info("Step 4 done — %d final chunks", len(final_chunks))
+
+    if not final_chunks:
+        logger.info("Step 4.2 — no chunks passed reranker threshold, returning fallback")
+        fallback = _get_fallback_answer(detected_language, school_id, db)
+        return _build_response(fallback, [], None, detected_language)
 
     # --- Step 5: Context Assembly ---
     context, allowed_citation_ids = build_context(final_chunks)
@@ -56,7 +75,8 @@ def run_online_pipeline(
                 len(context), len(allowed_citation_ids))
 
     # --- Step 6: Answer Generation ---
-    answer = generate_answer(rewritten_query, context, detected_language)
+    question_for_llm = f"Original question: {question}\nOptimized search query: {rewritten_query}"
+    answer = generate_answer(question_for_llm, context, detected_language)
     logger.info("Step 6 done — answer=%d chars", len(answer))
 
     # --- Step 7: Validation ---
@@ -111,6 +131,8 @@ def _get_fallback_answer(
     school_id: UUID,
     db: Optional[Session],
 ) -> str:
+    from app.core.config import settings as app_settings
+    email = app_settings.CONTACT_EMAIL or "the university admissions office"
     if db:
         setting = (
             db.query(ChatbotSetting)
@@ -122,10 +144,9 @@ def _get_fallback_answer(
                 return setting.fallback_message_ar
             if detected_language == "English" and setting.fallback_message_en:
                 return setting.fallback_message_en
-    from app.core.config import settings as app_settings
     if detected_language == "Arabic":
-        return app_settings.FALLBACK_MESSAGE_AR
-    return app_settings.FALLBACK_MESSAGE_EN
+        return app_settings.FALLBACK_MESSAGE_AR.format(CONTACT_EMAIL=email)
+    return app_settings.FALLBACK_MESSAGE_EN.format(CONTACT_EMAIL=email)
 
 
 def _persist(

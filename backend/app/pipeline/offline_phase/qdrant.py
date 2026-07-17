@@ -116,8 +116,14 @@ def store_in_qdrant(
 
     if points:
         logger.info("Upserting %d points into Qdrant collection: %s", len(points), name)
-        client.upsert(collection_name=name, points=points)
-        logger.info("Qdrant upsert complete.")
+        batch_size = 200
+        for i in range(0, len(points), batch_size):
+            batch = points[i:i + batch_size]
+            client.upsert(collection_name=name, points=batch)
+            logger.debug("Upserted batch %d/%d (%d points)", i // batch_size + 1,
+                         (len(points) + batch_size - 1) // batch_size, len(batch))
+        logger.info("Qdrant upsert complete (%d points in %d batches).",
+                     len(points), (len(points) + batch_size - 1) // batch_size)
     else:
         logger.info("No valid points to upsert.")
 
@@ -148,6 +154,8 @@ def _save_parents_to_postgres(chunks: List[Document], db: Session):
             chunk_order=meta.get("chunk_order", 0),
             chunk_type="parent",
             breadcrumb=meta.get("breadcrumb", ""),
+            document_version=meta.get("document_version"),
+            effective_date=meta.get("effective_date"),
             chunk_metadata=meta,
         )
         db.add(db_chunk)

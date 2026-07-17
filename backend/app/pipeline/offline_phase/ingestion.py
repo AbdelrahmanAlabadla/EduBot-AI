@@ -32,6 +32,7 @@ def ingest_file(file_path: str | Path) -> List[Document]:
         result_type="markdown",
         verbose=False,
         language="en",
+        max_timeout=600,
     )
 
     try:
