@@ -1,6 +1,8 @@
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from uuid import UUID
+
+from qdrant_client.http.models import Filter, FieldCondition, MatchValue
 
 from app.core.config import settings
 from app.pipeline.online_phase.rrf import rrf_search
@@ -36,51 +38,119 @@ def hybrid_search(
         dense_limit=dense_limit,
         sparse_limit=sparse_limit,
         final_limit=final_limit,
-        score_threshold=score_threshold,
+        # Qdrant RRF scores are tiny (~0.001-0.05), so threshold must be 0.0.
+        # Filtering happens at the reranker stage via RAG_SCORE_THRESHOLD.
+        score_threshold=0.0,
     )
+
+
+def expand_by_page(
+    chunks: List[Dict[str, Any]],
+    school_id: UUID,
+    max_per_page: int = 500,
+) -> List[Dict[str, Any]]:
+    page_numbers = set()
+    for chunk in chunks:
+        pn = chunk.get("payload", {}).get("page_number")
+        if pn is not None:
+            page_numbers.add(pn)
+
+    if not page_numbers:
+        return chunks
+
+    client = _get_client()
+    collection = _collection_name(school_id)
+
+    all_points: Dict[str, Dict[str, Any]] = {}
+    for pn in sorted(page_numbers):
+        try:
+            result = client.scroll(
+                collection_name=collection,
+                scroll_filter=Filter(
+                    must=[
+                        FieldCondition(
+                            key="page_number",
+                            match=MatchValue(value=pn),
+                        ),
+                    ],
+                ),
+                limit=max_per_page,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for point in result[0]:
+                pid = str(point.id)
+                if pid not in all_points:
+                    all_points[pid] = {
+                        "id": pid,
+                        "payload": point.payload or {},
+                        "score": 0.0,
+                    }
+        except Exception as e:
+            logger.warning("Page expansion failed for page %s: %s", pn, e)
+
+    seen_ids = {str(c.get("id")) for c in chunks}
+    expanded = list(chunks)
+    for pid, pdata in all_points.items():
+        if pid not in seen_ids:
+            expanded.append(pdata)
+
+    logger.info("Page expansion: %d pages → %d → %d chunks",
+                len(page_numbers), len(chunks), len(expanded))
+    return expanded
 
 
 def fetch_parent_chunks(
     child_chunks: List[Dict[str, Any]],
     db: Session,
 ) -> List[Dict[str, Any]]:
-    parent_ids = set()
-    child_by_parent = {}
+    results = []
+    needs_db = set()
+    needs_db_chunks = []
 
     for chunk in child_chunks:
         payload = chunk.get("payload", {})
-        parent_id = payload.get("parent_id")
-        if parent_id:
-            parent_ids.add(parent_id)
-            child_by_parent.setdefault(parent_id, []).append(chunk)
-
-    if not parent_ids:
-        return child_chunks
-
-    parents = (
-        db.query(DocumentChunk)
-        .filter(DocumentChunk.id.in_(list(parent_ids)))
-        .all()
-    )
-    parent_map = {str(p.id): p for p in parents}
-
-    results = []
-    seen_ids = set()
-    for chunk in child_chunks:
-        pid = chunk.get("payload", {}).get("parent_id")
-        if pid and pid in parent_map:
-            key = f"parent_{pid}"
-            if key not in seen_ids:
-                parent = parent_map[pid]
-                # Attach parent text as full_context to first child
-                chunk["full_context"] = parent.chunk_text
-                chunk["breadcrumb"] = parent.breadcrumb or chunk.get("payload", {}).get("breadcrumb", "")
-                seen_ids.add(key)
+        parent_text = payload.get("parent_text")
+        if parent_text:
+            chunk["full_context"] = parent_text
+            chunk["breadcrumb"] = payload.get("breadcrumb", "")
+            results.append(chunk)
         else:
+            pid = payload.get("parent_id")
+            if pid:
+                needs_db.add(pid)
+            needs_db_chunks.append(chunk)
+
+    if needs_db and db:
+        parents = (
+            db.query(DocumentChunk)
+            .filter(DocumentChunk.id.in_(list(needs_db)))
+            .all()
+        )
+        parent_map = {str(p.id): p for p in parents}
+        logger.info("Fetched %d parent chunks from Postgres (fallback)", len(parent_map))
+
+        for chunk in needs_db_chunks:
+            payload = chunk.get("payload", {})
+            pid = payload.get("parent_id")
+            ctype = payload.get("chunk_type", "")
+            if pid and pid in parent_map:
+                parent = parent_map[pid]
+                if ctype in ("table", "faq"):
+                    chunk_content = payload.get("page_content", "")
+                    chunk["full_context"] = f"{parent.chunk_text}\n\n--- {ctype.title()} Data ---\n\n{chunk_content}"
+                else:
+                    chunk["full_context"] = parent.chunk_text
+                chunk["breadcrumb"] = parent.breadcrumb or payload.get("breadcrumb", "")
+            else:
+                st = payload.get("searchable_text")
+                chunk["full_context"] = st if st else payload.get("page_content", "")
+            results.append(chunk)
+    else:
+        for chunk in needs_db_chunks:
             payload = chunk.get("payload", {})
             st = payload.get("searchable_text")
             chunk["full_context"] = st if st else payload.get("page_content", "")
-        results.append(chunk)
+            results.append(chunk)
 
-    logger.info("Fetched %d parent chunks from Postgres", len(parent_map))
     return results

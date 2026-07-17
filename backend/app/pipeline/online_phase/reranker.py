@@ -62,6 +62,7 @@ def rerank_and_filter(
         top_k = settings.RAG_FINAL_K
     if score_threshold is None:
         score_threshold = settings.RAG_SCORE_THRESHOLD
+    fallback_k = getattr(settings, "RAG_FALLBACK_K", 10)
 
     if not chunks:
         return []
@@ -76,27 +77,38 @@ def rerank_and_filter(
 
     logger.info("Reranking %d chunks with cross-encoder...", len(pairs))
 
-    normalized = []
     try:
         raw_scores = reranker.compute_score(pairs, normalize=False)
     except Exception as e:
-        logger.warning("Cross-encoder compute_score failed: %s — falling back to RRF scores", e)
-        raw_scores = None
+        use_k = max(top_k, fallback_k)
+        logger.warning("Cross-encoder compute_score failed: %s — falling back to top-%d from RRF scores", e, use_k)
+        scored = [(chunk, chunk.get("score", 0)) for chunk in chunks]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        kept = []
+        for chunk, score in scored[:use_k]:
+            chunk["rerank_score"] = float(score)
+            kept.append(chunk)
+        logger.info("Rerank fallback: kept %d / %d chunks (top-%d)", len(kept), len(chunks), use_k)
+        return kept
 
     if raw_scores and len(raw_scores) == len(chunks):
         raw_min, raw_max = min(raw_scores), max(raw_scores)
-        sigmoid = [1.0 / (1.0 + math.exp(-s)) for s in raw_scores]
-        sig_min, sig_max = min(sigmoid), max(sigmoid)
-        if sig_max > sig_min:
-            normalized = [(s - sig_min) / (sig_max - sig_min) for s in sigmoid]
-        else:
-            normalized = [1.0] * len(sigmoid)
-        norm_min, norm_max = min(normalized), max(normalized)
-        logger.info("Rerank raw logits: min=%.4f  max=%.4f  |  sigmoid: min=%.4f  max=%.4f  |  normed: min=%.4f  max=%.4f  (threshold=%.2f)",
-                     raw_min, raw_max, sig_min, sig_max, norm_min, norm_max, score_threshold)
+        normalized = [1.0 / (1.0 + math.exp(-s)) for s in raw_scores]
+        sig_min, sig_max = min(normalized), max(normalized)
+        logger.info("Rerank raw logits: min=%.4f  max=%.4f  |  sigmoid: min=%.4f  max=%.4f  (threshold=%.2f)",
+                     raw_min, raw_max, sig_min, sig_max, score_threshold)
     else:
-        logger.warning("Cross-encoder returned no valid scores — falling back to RRF scores for ordering")
-        normalized = [chunk.get("score", 0) for chunk in chunks]
+        use_k = max(top_k, fallback_k)
+        logger.warning("Cross-encoder returned %s scores for %d chunks — falling back to top-%d from RRF scores",
+                       "no" if not raw_scores else str(len(raw_scores)), len(chunks), use_k)
+        scored = [(chunk, chunk.get("score", 0)) for chunk in chunks]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        kept = []
+        for chunk, score in scored[:use_k]:
+            chunk["rerank_score"] = float(score)
+            kept.append(chunk)
+        logger.info("Rerank fallback: kept %d / %d chunks (top-%d)", len(kept), len(chunks), use_k)
+        return kept
 
     scored = list(zip(chunks, normalized))
     scored.sort(key=lambda x: x[1], reverse=True)
@@ -109,5 +121,13 @@ def rerank_and_filter(
 
     kept = filtered[:top_k]
     logger.info("Rerank: kept %d / %d chunks (threshold=%.2f)", len(kept), len(chunks), score_threshold)
+
+    if logger.isEnabledFor(logging.DEBUG):
+        for chunk, score in scored:
+            p = chunk.get("payload", {})
+            decision = "KEPT" if score >= score_threshold else "DROP"
+            logger.debug("Rerank %s score=%.4f %s",
+                         decision, score,
+                         chunk.get("breadcrumb") or p.get("breadcrumb", "?"))
 
     return kept

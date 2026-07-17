@@ -1,6 +1,6 @@
 import logging
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 from uuid import UUID
 
 from langchain_core.documents import Document
@@ -11,6 +11,7 @@ from app.pipeline.offline_phase.parser import parse_documents
 from app.pipeline.offline_phase.boilerplate import detect_boilerplate
 from app.pipeline.offline_phase.clean_norm import clean_and_normalize, STRUCTURAL_PATTERNS
 from app.pipeline.offline_phase.chunking import chunk_documents
+from app.pipeline.offline_phase.summarizer import generate_parent_summaries
 from app.pipeline.offline_phase.embedding import embed_chunks
 from app.pipeline.offline_phase.qdrant import store_in_qdrant
 
@@ -22,6 +23,8 @@ def run_offline_pipeline(
     school_id: UUID,
     document_id: UUID,
     db: Session,
+    document_version: Optional[str] = None,
+    effective_date: Optional[str] = None,
 ) -> List[Document]:
     logger.info("=== Starting offline pipeline ===")
     logger.info("File: %s | School: %s | Doc: %s", file_path, school_id, document_id)
@@ -48,10 +51,26 @@ def run_offline_pipeline(
     cleaned = clean_and_normalize(blocks, extra_patterns=boilerplate_patterns)
     logger.info("Cleaned %d blocks.", len(cleaned))
 
-    chunks = chunk_documents(cleaned, document_id, school_id, extra_boilerplate=boilerplate_patterns)
+    chunks = chunk_documents(
+        cleaned, document_id, school_id,
+        extra_boilerplate=boilerplate_patterns,
+        document_version=document_version,
+        effective_date=effective_date,
+    )
     logger.info("Created %d chunks (%d child).",
                 len(chunks),
                 sum(1 for c in chunks if c.metadata.get("chunk_type") == "child"))
+
+    # Generate summary chunks for parent sections (3 concurrent LM Studio calls)
+    parent_chunks = [c for c in chunks if c.metadata.get("chunk_type") == "parent"]
+    if parent_chunks:
+        summary_chunks = generate_parent_summaries(parent_chunks, document_id, school_id)
+        chunks.extend(summary_chunks)
+        logger.info("Generated %d summary chunks.", len(summary_chunks))
+
+    # Re-assign chunk_order so new summary chunks get valid sequential IDs
+    for i, chunk in enumerate(chunks):
+        chunk.metadata["chunk_order"] = i
 
     embedded = embed_chunks(chunks)
 

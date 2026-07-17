@@ -9,7 +9,16 @@ from app.models.chatbot_setting import ChatbotSetting
 logger = logging.getLogger(__name__)
 
 _NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)*")
+_COURSE_CODE_RE = re.compile(r"[A-Za-z]{2,4}\d{3,4}")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+_CURRENCY_TOKENS = {'aed', 'dh', 'dhs', 'usd', 'eur', 'gbp', '$', '€', '£', 'sar', 'omr', 'qar', 'bhd', 'kwd'}
+
+
+def _normalize_number_str(text: str) -> str:
+    normalized = re.sub(r'[\s,.\-–—()\[\]{}]', '', text).lower()
+    for token in _CURRENCY_TOKENS:
+        normalized = normalized.replace(token, '')
+    return normalized.strip()
 
 
 def validate_and_repair(
@@ -37,13 +46,27 @@ def validate_and_repair(
 
     tier2_issues = _tier2_find_unsubstantiated(answer, context_chunks)
     if tier2_issues:
-        cleaned, stripped_count = _strip_sentences(answer, tier2_issues)
-        if not cleaned.strip():
-            logger.warning("Tier 2: all sentences stripped — returning fallback")
-            return _fallback_answer(detected_language, school_id, db), False
-        note = _get_verification_note(detected_language, school_id, db)
-        answer = cleaned + "\n\n" + note
-        logger.info("Tier 2: stripped %d sentence(s), appended verification note", stripped_count)
+        logger.warning("Tier 2 (unsubstantiated content) FAILED — attempting targeted retry")
+        tier2_retry_prompt = (
+            f"Your previous answer contained course codes or numbers not found in the "
+            f"provided context: {', '.join(tier2_issues)}. "
+            f"Only include information explicitly supported by the context. "
+            f"Do not invent course codes, fees, numbers, or any specific data."
+        )
+        corrected = _retry_generation(question, context, detected_language, tier2_retry_prompt)
+        tier2_issues_2 = _tier2_find_unsubstantiated(corrected, context_chunks)
+        if not tier2_issues_2:
+            answer = corrected
+            logger.info("Tier 2 corrected after retry")
+        else:
+            logger.warning("Tier 2 still failing after retry — stripping flagged sentences")
+            cleaned, stripped_count = _strip_sentences(answer, tier2_issues)
+            if not cleaned.strip():
+                logger.warning("Tier 2: all sentences stripped — returning fallback")
+                return _fallback_answer(detected_language, school_id, db), False
+            note = _get_verification_note(detected_language, school_id, db)
+            answer = cleaned + "\n\n" + note
+            logger.info("Tier 2: stripped %d sentence(s), appended verification note", stripped_count)
 
     return answer, True
 
@@ -89,7 +112,9 @@ def _tier2_find_unsubstantiated(
     context_chunks: List[Dict[str, Any]],
 ) -> List[str]:
     numbers_in_answer = list(_NUMBER_RE.finditer(answer))
-    if not numbers_in_answer:
+    codes_in_answer = list(_COURSE_CODE_RE.finditer(answer))
+
+    if not numbers_in_answer and not codes_in_answer:
         return []
 
     ground_text = ""
@@ -102,9 +127,15 @@ def _tier2_find_unsubstantiated(
 
     ground_numbers = set()
     for m in _NUMBER_RE.finditer(ground_text):
-        norm = m.group().replace(",", "").strip()
-        if norm:
+        norm = _normalize_number_str(m.group())
+        if norm and not _is_trivial_number(m.group()):
             ground_numbers.add(norm)
+
+    ground_codes = set()
+    for m in _COURSE_CODE_RE.finditer(ground_text):
+        norm = _normalize_number_str(m.group())
+        if norm:
+            ground_codes.add(norm)
 
     sentences = _SENTENCE_SPLIT_RE.split(answer)
     sentence_positions = []
@@ -117,7 +148,7 @@ def _tier2_find_unsubstantiated(
     flagged_sentences = set()
     for match in numbers_in_answer:
         num_raw = match.group()
-        num_norm = num_raw.replace(",", "").strip()
+        num_norm = _normalize_number_str(num_raw)
         if not num_norm:
             continue
         if _is_trivial_number(num_raw):
@@ -126,6 +157,18 @@ def _tier2_find_unsubstantiated(
             num_start = match.start()
             for start, end, sentence in sentence_positions:
                 if start <= num_start < end:
+                    flagged_sentences.add(sentence.strip())
+                    break
+
+    for match in codes_in_answer:
+        code = match.group()
+        code_norm = _normalize_number_str(code)
+        if not code_norm:
+            continue
+        if code_norm not in ground_codes:
+            code_start = match.start()
+            for start, end, sentence in sentence_positions:
+                if start <= code_start < end:
                     flagged_sentences.add(sentence.strip())
                     break
 

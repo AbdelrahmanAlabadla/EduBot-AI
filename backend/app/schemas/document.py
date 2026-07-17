@@ -31,6 +31,8 @@ class DocumentChunkResponse(BaseModel):
     parent_id: Optional[UUID]
     searchable_text: Optional[str]
     qdrant_point_id: Optional[str]
+    document_version: Optional[str]
+    effective_date: Optional[datetime]
     chunk_metadata: Optional[dict]
     created_at: datetime
 

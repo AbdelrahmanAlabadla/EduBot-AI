@@ -48,9 +48,16 @@ def embed_chunks(chunks: List[Document], batch_size: int = 32) -> List[Document]
 
     texts = []
     for c in to_embed:
-        if c.metadata.get("chunk_type") == "table":
+        ctype = c.metadata.get("chunk_type")
+        if ctype == "table":
             st = c.metadata.get("searchable_text")
             texts.append(st if st else c.page_content)
+        elif ctype in ("child", "summary"):
+            breadcrumb = c.metadata.get("breadcrumb", "")
+            if breadcrumb:
+                texts.append(f"{breadcrumb}: {c.page_content}")
+            else:
+                texts.append(c.page_content)
         else:
             texts.append(c.page_content)
     logger.info("Embedding %d chunks with BGE-M3 (dense + sparse, batch_size=%d)...",

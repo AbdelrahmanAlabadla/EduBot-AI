@@ -19,6 +19,10 @@ STRUCTURAL_PATTERNS = [
     re.compile(r"^Next Review date:.*$", re.MULTILINE),
     re.compile(r"^Responsible Entity:.*$", re.MULTILINE),
     re.compile(r"^\d+ \| P a g e$", re.MULTILINE),
+    re.compile(r"^Abu Dhabi University \| Undergraduate Catalog.*$", re.MULTILINE),
+    re.compile(r"^Page \d+ of \d+$", re.MULTILINE),
+    re.compile(r"^\d{1,4}$", re.MULTILINE),
+    re.compile(r"^© \d{4} ABU DHABI UNIVERSITY.*$", re.MULTILINE),
 ]
 
 ZERO_WIDTH_CHARS = re.compile(r"[\u200b\u200c\u200d\u2060\u2061\u2062\u2063\u2064\ufeff]")
@@ -51,6 +55,23 @@ def clean_and_normalize(
         text = TRAILING_WS.sub("", text)
         text = MULTI_NEWLINE.sub("\n\n", text)
         text = MULTI_SPACE.sub(" ", text)
+
+        # 5. Remove TOC entries (short lines ending in a page number)
+        lines = text.split("\n")
+        filtered_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped and len(stripped) < 60 and re.match(
+                r"^[\w\s\&\-\(\)\,\.\/\']+[\s\.]{1,2}\d{1,4}\.?$", stripped
+            ):
+                exclude = ("bachelor", "master", "college", "degree", "school",
+                           "institute", "professor", "phd", "doctor", "program",
+                           "certificate", "diploma", "credit", "prerequisite",
+                           "curriculum", "faculty", "dean")
+                if not any(kw in stripped.lower() for kw in exclude):
+                    continue
+            filtered_lines.append(line)
+        text = "\n".join(filtered_lines)
 
         text = text.strip()
         if not text:

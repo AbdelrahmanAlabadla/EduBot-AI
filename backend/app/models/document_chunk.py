@@ -19,6 +19,8 @@ class DocumentChunk(Base):
     parent_id = Column(UUID(as_uuid=True), ForeignKey("document_chunks.id"), nullable=True)
     searchable_text = Column(Text, nullable=True)
     qdrant_point_id = Column(String(255), nullable=True)
+    document_version = Column(String(50), nullable=True)
+    effective_date = Column(DateTime(timezone=True), nullable=True)
     chunk_metadata = Column("metadata", JSON, nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 

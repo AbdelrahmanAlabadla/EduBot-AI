@@ -1,7 +1,9 @@
 import os
 import uuid
+from datetime import datetime
 from pathlib import Path
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks, status
+from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks, Form, status
 from sqlalchemy.orm import Session
 from uuid import UUID
 from app.database.connection import get_db
@@ -16,7 +18,12 @@ from app.pipeline.offline_phase.pipeline import run_offline_pipeline
 router = APIRouter(prefix="/documents", tags=["Documents"])
 
 
-def process_document_background(db: Session, doc_id: UUID):
+def process_document_background(
+    db: Session,
+    doc_id: UUID,
+    document_version: Optional[str] = None,
+    effective_date: Optional[str] = None,
+):
     db = next(get_db())
     doc = db.query(Document).filter(Document.id == doc_id).first()
     if not doc:
@@ -29,6 +36,8 @@ def process_document_background(db: Session, doc_id: UUID):
             school_id=doc.school_id,
             document_id=doc.id,
             db=db,
+            document_version=document_version,
+            effective_date=effective_date,
         )
         doc.status = "completed"
         db.commit()
@@ -42,6 +51,8 @@ def process_document_background(db: Session, doc_id: UUID):
 def upload_document(
     file: UploadFile = File(...),
     language: str = "en",
+    document_version: Optional[str] = Form(None),
+    effective_date: Optional[str] = Form(None),
     background_tasks: BackgroundTasks = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -58,6 +69,14 @@ def upload_document(
     file_path = upload_dir / f"{file_id}.{ext}"
     with open(file_path, "wb") as f:
         f.write(content)
+
+    parsed_effective_date = None
+    if effective_date:
+        try:
+            parsed_effective_date = datetime.fromisoformat(effective_date)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid effective_date format. Use ISO 8601 (e.g., 2026-01-15 or 2026-01-15T00:00:00).")
+
     doc = Document(
         school_id=current_user.school_id,
         name=file.filename,
@@ -72,7 +91,10 @@ def upload_document(
     db.commit()
     db.refresh(doc)
     if background_tasks:
-        background_tasks.add_task(process_document_background, db, doc.id)
+        background_tasks.add_task(
+            process_document_background,
+            db, doc.id, document_version, parsed_effective_date,
+        )
     return doc
 
 
@@ -137,5 +159,12 @@ def reprocess_document(
     doc.status = "uploaded"
     doc.processing_result = None
     db.commit()
-    background_tasks.add_task(process_document_background, db, doc.id)
+    # Read document_version/effective_date from metadata stored in chunk_metadata
+    # of existing parent chunks, or pass None if not available.
+    dv = getattr(doc, "version", None)
+    ed = getattr(doc, "effective_date", None)
+    background_tasks.add_task(
+        process_document_background,
+        db, doc.id, dv, ed,
+    )
     return doc
