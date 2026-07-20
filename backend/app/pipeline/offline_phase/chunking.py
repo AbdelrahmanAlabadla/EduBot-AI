@@ -22,7 +22,30 @@ FAQ_Q_PATTERN = re.compile(r"^\*{0,2}Q\s*[:：]\s*(.+)$", re.IGNORECASE | re.MUL
 FAQ_A_PATTERN = re.compile(r"^\*{0,2}A\s*[:：]\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 SECTION_NUM_PATTERN = re.compile(r"^(\d+(?:\.\d+)*)\s*[\.\)\-]\s+")
 
-SEARCHABLE_TYPES = {"child", "single", "table", "summary"}
+LIST_BULLET_PATTERN = re.compile(r"^[\s]*[-•‣⁃]\s+")
+LIST_NUMBERED_PATTERN = re.compile(r"^[\s]*\d+[\.\)]\s+")
+CALLOUT_PATTERN = re.compile(
+    r"^\s*(?:\*{0,2})(IMPORTANT|NOTE|WARNING|REMINDER|NOTICE|ATTENTION)"
+    r"(?:\*{0,2})?\s*[:：]\s*(?:\*{0,2})?(.*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+CONTACT_EMAIL = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+CONTACT_PHONE = re.compile(
+    r"(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4}"
+    r"|\d{3}[-.\s]?\d{4}"
+)
+CONTACT_KEYWORDS = [
+    "admissions office", "registrar", "student affairs", "academic office",
+    "admission office", "registrar's office", "finance office", "hr office",
+    "department of", "office of", "campus address", "contact us",
+]
+PROCEDURE_STEP = re.compile(r"^\s*(?:Step\s+\d+|Steps?)\s*[:：]?\s*", re.IGNORECASE | re.MULTILINE)
+PROCEDURE_ACTION_VERBS = [
+    "submit", "upload", "complete", "register", "apply", "pay",
+    "download", "fill", "provide", "attach", "select", "choose",
+]
+
+SEARCHABLE_TYPES = {"child", "single", "table", "faq", "list", "callout", "contact", "procedure", "summary"}
 CONTEXT_TYPES = {"parent", "single"}
 
 BOILERPLATE_BLOCKLIST: List[re.Pattern] = [
@@ -158,6 +181,54 @@ def _is_faq(text: str) -> bool:
     return has_q or has_a
 
 
+def _is_list(text: str) -> bool:
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if len(lines) < 2:
+        return False
+    bullet_hits = sum(1 for l in lines if LIST_BULLET_PATTERN.match(l))
+    numbered_hits = sum(1 for l in lines if LIST_NUMBERED_PATTERN.match(l))
+    total_list_lines = bullet_hits + numbered_hits
+    return total_list_lines >= 2 and (total_list_lines / len(lines)) >= 0.5
+
+
+def _is_callout(text: str) -> bool:
+    return bool(CALLOUT_PATTERN.search(text))
+
+
+def _is_contact(text: str) -> bool:
+    has_email = bool(CONTACT_EMAIL.search(text))
+    has_phone = bool(CONTACT_PHONE.search(text))
+    has_keyword = any(kw in text.lower() for kw in CONTACT_KEYWORDS)
+    if has_email and has_phone:
+        return True
+    if has_keyword and (has_email or has_phone):
+        return True
+    return False
+
+
+def _is_procedure(text: str) -> bool:
+    if PROCEDURE_STEP.search(text):
+        return True
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if len(lines) < 2:
+        return False
+    action_count = 0
+    for line in lines:
+        lower = line.lower()
+        for verb in PROCEDURE_ACTION_VERBS:
+            if lower.startswith(verb):
+                action_count += 1
+                break
+    return action_count >= 2 and (action_count / len(lines)) >= 0.3
+
+
+def _extract_callout_severity(text: str) -> str:
+    m = CALLOUT_PATTERN.search(text)
+    if m:
+        return m.group(1).strip().lower()
+    return "note"
+
+
 def _is_boilerplate(text: str, extra_patterns: Optional[List[re.Pattern]] = None) -> bool:
     all_patterns = list(BOILERPLATE_BLOCKLIST)
     if extra_patterns:
@@ -257,7 +328,7 @@ def _extract_qa_pairs(lines: List[str]) -> List[Tuple[str, str]]:
 
 def _get_semantic_embedder():
     from FlagEmbedding import BGEM3FlagModel
-    return BGEM3FlagModel("BAAI/bge-m3", use_fp16=False, device="cpu")
+    return BGEM3FlagModel("BAAI/bge-m3", use_fp16=True, device="cuda")
 
 
 # ---------------------------------------------------------------------------
@@ -600,6 +671,109 @@ def _create_faq_chunks(
 
 
 # ---------------------------------------------------------------------------
+# New chunk creators: list, callout, contact, procedure
+# ---------------------------------------------------------------------------
+
+
+def _create_list_chunk(
+    text: str, breadcrumb: str, parent_id: Optional[str],
+    document_id: UUID, school_id: UUID,
+    page_number: Optional[int] = None, source_file: Optional[str] = None,
+    parent_text: Optional[str] = None,
+) -> Document:
+    searchable = text
+    doc = Document(
+        page_content=text,
+        metadata={
+            "chunk_type": "list",
+            "breadcrumb": breadcrumb,
+            "parent_id": parent_id,
+            "parent_text": parent_text,
+            "document_id": str(document_id),
+            "school_id": str(school_id),
+            "searchable_text": searchable,
+        },
+    )
+    doc.metadata["page_number"] = page_number
+    doc.metadata["source_file"] = source_file
+    return doc
+
+
+def _create_callout_chunk(
+    text: str, breadcrumb: str, parent_id: Optional[str],
+    document_id: UUID, school_id: UUID,
+    page_number: Optional[int] = None, source_file: Optional[str] = None,
+    parent_text: Optional[str] = None,
+) -> Document:
+    severity = _extract_callout_severity(text)
+    searchable = text
+    doc = Document(
+        page_content=text,
+        metadata={
+            "chunk_type": "callout",
+            "breadcrumb": breadcrumb,
+            "parent_id": parent_id,
+            "parent_text": parent_text,
+            "document_id": str(document_id),
+            "school_id": str(school_id),
+            "searchable_text": searchable,
+            "severity": severity,
+        },
+    )
+    doc.metadata["page_number"] = page_number
+    doc.metadata["source_file"] = source_file
+    return doc
+
+
+def _create_contact_chunk(
+    text: str, breadcrumb: str, parent_id: Optional[str],
+    document_id: UUID, school_id: UUID,
+    page_number: Optional[int] = None, source_file: Optional[str] = None,
+    parent_text: Optional[str] = None,
+) -> Document:
+    searchable = text
+    doc = Document(
+        page_content=text,
+        metadata={
+            "chunk_type": "contact",
+            "breadcrumb": breadcrumb,
+            "parent_id": parent_id,
+            "parent_text": parent_text,
+            "document_id": str(document_id),
+            "school_id": str(school_id),
+            "searchable_text": searchable,
+        },
+    )
+    doc.metadata["page_number"] = page_number
+    doc.metadata["source_file"] = source_file
+    return doc
+
+
+def _create_procedure_chunk(
+    text: str, breadcrumb: str, parent_id: Optional[str],
+    document_id: UUID, school_id: UUID,
+    page_number: Optional[int] = None, source_file: Optional[str] = None,
+    parent_text: Optional[str] = None,
+) -> Document:
+    searchable = text
+    doc = Document(
+        page_content=text,
+        metadata={
+            "chunk_type": "procedure",
+            "breadcrumb": breadcrumb,
+            "parent_id": parent_id,
+            "parent_text": parent_text,
+            "document_id": str(document_id),
+            "school_id": str(school_id),
+            "searchable_text": searchable,
+        },
+    )
+    doc.metadata["page_number"] = page_number
+    doc.metadata["source_file"] = source_file
+    return doc
+
+
+# ---------------------------------------------------------------------------
 # Leaf chunking
 # ---------------------------------------------------------------------------
 
@@ -626,6 +800,22 @@ def _chunk_leaf(
     if _is_faq(content):
         return _create_faq_chunks(content, breadcrumb, parent_id, document_id, school_id,
                                   page_number, source_file, parent_text=parent_text)
+
+    if _is_procedure(content):
+        return [_create_procedure_chunk(content, breadcrumb, parent_id, document_id, school_id,
+                                        page_number, source_file, parent_text=parent_text)]
+
+    if _is_callout(content):
+        return [_create_callout_chunk(content, breadcrumb, parent_id, document_id, school_id,
+                                      page_number, source_file, parent_text=parent_text)]
+
+    if _is_list(content):
+        return [_create_list_chunk(content, breadcrumb, parent_id, document_id, school_id,
+                                   page_number, source_file, parent_text=parent_text)]
+
+    if _is_contact(content):
+        return [_create_contact_chunk(content, breadcrumb, parent_id, document_id, school_id,
+                                      page_number, source_file, parent_text=parent_text)]
 
     tokens = TOKENIZER.encode(content)
     token_count = len(tokens)
@@ -666,9 +856,11 @@ def post_process_chunks(
     merged_forward = 0
     merged_backward = 0
 
+    PROTECTED_TYPES = {"table", "list", "callout", "contact", "procedure", "faq"}
+
     while i < len(chunks):
         chunk = chunks[i]
-        if chunk.metadata.get("chunk_type") == "table":
+        if chunk.metadata.get("chunk_type") in PROTECTED_TYPES:
             filtered.append(chunk)
             i += 1
             continue

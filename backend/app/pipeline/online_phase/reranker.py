@@ -25,7 +25,8 @@ def _get_reranker():
         from FlagEmbedding import FlagReranker
         _reranker = FlagReranker(
             settings.RERANKER_MODEL,
-            use_fp16=False,
+            use_fp16=True,
+            device="cuda",
         )
         logger.info("Reranker loaded.")
     return _reranker
