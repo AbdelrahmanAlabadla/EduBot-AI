@@ -76,7 +76,7 @@ def build_index():
     else:
         docs = load_chunks()
         parent_map = build_parent_map(docs)
-        print(f"Embedding {len(docs)} chunks (first time only, ~5min on CPU)...", flush=True)
+        print(f"Embedding {len(docs)} chunks (first time only, on GPU)...", flush=True)
         print("  Parent map: {} entries".format(len(parent_map)), flush=True)
         print("  Subsequent launches will be instant (cache).\n", flush=True)
         t0 = time.time()
