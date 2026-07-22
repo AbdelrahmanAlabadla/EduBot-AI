@@ -2,8 +2,6 @@ import logging
 from typing import List, Dict, Any, Optional
 from uuid import UUID
 
-from qdrant_client.http.models import Filter, FieldCondition, MatchValue
-
 from app.core.config import settings
 from app.pipeline.online_phase.rrf import rrf_search
 from app.pipeline.offline_phase.qdrant import _get_client, _collection_name
@@ -42,62 +40,6 @@ def hybrid_search(
         # Filtering happens at the reranker stage via RAG_SCORE_THRESHOLD.
         score_threshold=0.0,
     )
-
-
-def expand_by_page(
-    chunks: List[Dict[str, Any]],
-    school_id: UUID,
-    max_per_page: int = 500,
-) -> List[Dict[str, Any]]:
-    page_numbers = set()
-    for chunk in chunks:
-        pn = chunk.get("payload", {}).get("page_number")
-        if pn is not None:
-            page_numbers.add(pn)
-
-    if not page_numbers:
-        return chunks
-
-    client = _get_client()
-    collection = _collection_name(school_id)
-
-    all_points: Dict[str, Dict[str, Any]] = {}
-    for pn in sorted(page_numbers):
-        try:
-            result = client.scroll(
-                collection_name=collection,
-                scroll_filter=Filter(
-                    must=[
-                        FieldCondition(
-                            key="page_number",
-                            match=MatchValue(value=pn),
-                        ),
-                    ],
-                ),
-                limit=max_per_page,
-                with_payload=True,
-                with_vectors=False,
-            )
-            for point in result[0]:
-                pid = str(point.id)
-                if pid not in all_points:
-                    all_points[pid] = {
-                        "id": pid,
-                        "payload": point.payload or {},
-                        "score": 0.0,
-                    }
-        except Exception as e:
-            logger.warning("Page expansion failed for page %s: %s", pn, e)
-
-    seen_ids = {str(c.get("id")) for c in chunks}
-    expanded = list(chunks)
-    for pid, pdata in all_points.items():
-        if pid not in seen_ids:
-            expanded.append(pdata)
-
-    logger.info("Page expansion: %d pages → %d → %d chunks",
-                len(page_numbers), len(chunks), len(expanded))
-    return expanded
 
 
 def fetch_parent_chunks(

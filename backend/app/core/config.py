@@ -17,8 +17,8 @@ class Settings(BaseSettings):
 
     # LLM (LM Studio)
     LLM_BASE_URL: str = "http://127.0.0.1:1234/api/v1"
-    LLM_MODEL: str = "google/gemma-4-e2b"
-    RAG_MODEL: str = "google/gemma-4-e2b"
+    LLM_MODEL: str = "mistralai/ministral-3-3b"
+    RAG_MODEL: str = "mistralai/ministral-3-3b"
     LLM_MAX_TOKENS: int = 8000
     REWRITE_MODEL: str = "mistralai/ministral-3-3b"
 
@@ -28,8 +28,11 @@ class Settings(BaseSettings):
     RAG_FINAL_K: int = 10
     RAG_FALLBACK_K: int = 15  # wider fallback for broad/list questions
     RAG_RRF_LIMIT: int = 35  # final fusion limit fed to reranker
-    RAG_SCORE_THRESHOLD: float = 0.01  # set >0 to filter low-relevance chunks (see rerank score logs)
+    RAG_SCORE_THRESHOLD: float = 0.30  # chunks below 30% sigmoid score are rejected
     RERANKER_MODEL: str = "BAAI/bge-reranker-v2-m3"
+    RERANKER_TYPE: str = "llm"  # "cross_encoder" | "llm" | "rrf"
+    LLM_RERANKER_BATCH_SIZE: int = 5
+    LLM_RERANKER_MAX_CHARS: int = 1200
 
     # Fallback message (global default, per-tenant overrides in chatbot_settings)
     FALLBACK_MESSAGE_EN: str = "I don't have that information. Please contact {CONTACT_EMAIL} for assistance."
