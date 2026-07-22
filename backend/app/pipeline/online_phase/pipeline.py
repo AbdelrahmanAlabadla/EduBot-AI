@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from app.pipeline.online_phase.query_rewrite import rewrite_query
-from app.pipeline.online_phase.retrieval import hybrid_search, expand_by_page, fetch_parent_chunks
+from app.pipeline.online_phase.retrieval import hybrid_search, fetch_parent_chunks
 from app.pipeline.online_phase.reranker import initial_judge, rerank_and_filter
 from app.pipeline.online_phase.context_builder import build_context
 from app.pipeline.online_phase.generator import generate_answer
@@ -31,23 +31,28 @@ def run_online_pipeline(
 ) -> dict:
     logger.info("=== Starting online pipeline (step 1/8) ===")
 
-    # --- Step 1: Query Rewrite & Language Detection ---
+    # --- Step 1: Query Rewrite & Language Detection (multi-query expansion) ---
     history = _load_conversation_history(conversation_id, db) if db and conversation_id else []
     rewrite_result = rewrite_query(question, history)
-    rewritten_query = rewrite_result["rewritten_query"]
+    rewritten_queries = rewrite_result["rewritten_queries"]
     detected_language = rewrite_result["detected_language"]
-    logger.info("Step 1 done — rewritten=%.80s lang=%s", rewritten_query, detected_language)
+    logger.info("Step 1 done — %d rewritten queries, lang=%s", len(rewritten_queries), detected_language)
 
-    # --- Step 2+3: Embed + Hybrid Qdrant Search ---
-    raw_chunks = hybrid_search(rewritten_query, school_id)
-    logger.info("Step 2+3 done — %d raw chunks", len(raw_chunks))
+    # --- Step 2+3: Embed + Hybrid Qdrant Search (for each query, merged) ---
+    all_raw = {}
+    for i, q in enumerate(rewritten_queries):
+        chunks = hybrid_search(q, school_id)
+        for c in chunks:
+            cid = str(c.get("id"))
+            if cid and cid not in all_raw:
+                all_raw[cid] = c
+    raw_chunks = sorted(all_raw.values(), key=lambda x: x.get("score", 0), reverse=True)[:settings.RAG_RRF_LIMIT]
+    logger.info("Step 2+3 done — %d raw chunks from %d queries", len(raw_chunks), len(rewritten_queries))
 
-    # --- Step 3b: Page Expansion — fetch ALL chunks from matched pages ---
-    expanded_chunks = expand_by_page(raw_chunks, school_id)
-    logger.info("Step 3b done — %d chunks after page expansion", len(expanded_chunks))
+    expanded_chunks = raw_chunks
 
     # --- Step 4: Retrieval Judge & Rerank ---
-    if not initial_judge(expanded_chunks, rewritten_query):
+    if not initial_judge(expanded_chunks, rewritten_queries[0]):
         logger.info("Step 4.1 — no relevant chunks, returning fallback")
         fallback = _get_fallback_answer(detected_language, school_id, db)
         return _build_response(fallback, [], None, detected_language)
@@ -61,7 +66,7 @@ def run_online_pipeline(
     if is_broad:
         logger.info("Broad/list question detected — using top_k=%d for reranker", rerank_k)
 
-    final_chunks = rerank_and_filter(parent_chunks, rewritten_query, top_k=rerank_k)
+    final_chunks = rerank_and_filter(parent_chunks, rewritten_queries[0], top_k=rerank_k)
     logger.info("Step 4 done — %d final chunks", len(final_chunks))
 
     if not final_chunks:
@@ -75,14 +80,14 @@ def run_online_pipeline(
                 len(context), len(allowed_citation_ids))
 
     # --- Step 6: Answer Generation ---
-    question_for_llm = f"Original question: {question}\nOptimized search query: {rewritten_query}"
+    question_for_llm = f"Original question: {question}\nOptimized search query: {rewritten_queries[0]}"
     answer = generate_answer(question_for_llm, context, detected_language)
     logger.info("Step 6 done — answer=%d chars", len(answer))
 
     # --- Step 7: Validation ---
     answer, validated = validate_and_repair(
         answer, allowed_citation_ids, final_chunks,
-        rewritten_query, context, detected_language,
+        rewritten_queries[0], context, detected_language,
         school_id=school_id, db=db,
     )
     logger.info("Step 7 done — validated=%s", validated)

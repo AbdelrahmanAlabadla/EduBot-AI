@@ -9,8 +9,8 @@ logger = logging.getLogger(__name__)
 
 
 _SYSTEM_PROMPT = """You are a query normalizer for a university chatbot.
-Your job: take a messy user query and output ONE clean, natural sentence,
-without changing what the user is actually asking.
+Your job: take a messy user query and output 3-5 clean search queries
+(synonym/phrasing variants) without changing what the user is actually asking.
 
 WHAT YOU MAY DO:
 1. Fix spelling and grammar mistakes.
@@ -35,8 +35,9 @@ WHAT YOU MUST NEVER DO (hard constraints):
   is allowed; swapping it for a different concept is not.
 - NEVER add a topic, subject, name, or detail that the user did not
   mention and that isn't the direct expansion of something they typed.
-- NEVER answer the question, and never add explanation, lists, or extra
-  keywords beyond the single rewritten sentence.
+- NEVER answer the question, and never add explanation or lists.
+  Each query in the array must be a natural question or phrase, not a
+  bullet list or sentence fragment.
 
 If you are unsure whether an abbreviation has a specific expansion, leave
 it as-is rather than guessing — guessing wrong is worse than not expanding.
@@ -44,25 +45,32 @@ it as-is rather than guessing — guessing wrong is worse than not expanding.
 Detect the primary language of the user's latest query. Output "Arabic"
 if any Arabic script is detected, otherwise "English".
 
-Return valid JSON only with exactly these two keys: "rewritten_query"
-and "detected_language". No markdown, no preamble.
+Return valid JSON only with exactly these two keys: "rewritten_queries"
+and "detected_language". "rewritten_queries" must be an array of 3-5 strings.
+The first item must be the original (cleaned-up) query. The remaining items
+must be synonym/phrasing variants — replace key terms with different words
+the catalog might use (e.g., "specializations" → "concentration / tracks /
+elective streams / specialization areas"; "programs" → "degrees / majors /
+fields of study"). Include the original query as item 1 so the search always
+gets the user's exact phrasing too.
+No markdown, no preamble.
 
 Examples (illustrating the PATTERN, not a fixed list of words to memorize):
   Input: "wha kind of programing program does this university have??"
-  Output: {"rewritten_query": "what kind of programming programs does this university have?", "detected_language": "English"}
+  Output: {"rewritten_queries": ["what kind of programming programs does this university have?", "what computing degrees does this university offer", "what types of software development majors are available at this university"], "detected_language": "English"}
 
   Input: "business degre"
-  Output: {"rewritten_query": "business degree", "detected_language": "English"}
+  Output: {"rewritten_queries": ["business degree", "business administration programs", "management majors offered"], "detected_language": "English"}
 
   Input: "wat r the gpa reqs for admission"
-  Output: {"rewritten_query": "what are the GPA requirements for admission?", "detected_language": "English"}
+  Output: {"rewritten_queries": ["what are the GPA requirements for admission?", "what GPA do I need to get accepted", "admission GPA criteria and minimum scores"], "detected_language": "English"}
 
   History: "is there a software engineering program?"
   Input: "i mean software engineering"
-  Output: {"rewritten_query": "is there a software engineering program?", "detected_language": "English"}
+  Output: {"rewritten_queries": ["is there a software engineering program?", "what software engineering degrees are available", "software engineering major concentration options"], "detected_language": "English"}
 
-  Input: "is there a software engineering program?"
-  Output: {"rewritten_query": "is there a software engineering program?", "detected_language": "English"}
+  Input: "specializations in BSc SWE"
+  Output: {"rewritten_queries": ["specializations in BSc SWE", "concentration tracks in software engineering", "elective streams BSc software engineering", "specialization areas for software engineering degree"], "detected_language": "English"}
   (Note: "software engineering" stays exactly as written — never becomes
   "computer science" or any other program name.)
 """
@@ -141,8 +149,11 @@ def _parse_rewrite_output(raw: str, original_query: str) -> Dict[str, str]:
         json_start = cleaned.index("{")
         json_end = cleaned.rindex("}") + 1
         parsed = json.loads(cleaned[json_start:json_end])
-        rewritten = parsed.get("rewritten_query", original_query)
+        queries = parsed.get("rewritten_queries", [original_query])
         lang = parsed.get("detected_language", "English")
+
+        if not isinstance(queries, list):
+            queries = [original_query]
 
         if lang not in ("Arabic", "English"):
             lang = "English"
@@ -152,7 +163,7 @@ def _parse_rewrite_output(raw: str, original_query: str) -> Dict[str, str]:
         elif lang == "English" and has_arabic:
             lang = "Arabic"
 
-        return {"rewritten_query": rewritten, "detected_language": lang}
+        return {"rewritten_queries": queries, "detected_language": lang}
     except (ValueError, json.JSONDecodeError):
         logger.warning("Could not parse rewrite output: %.120s", raw)
         return _fallback(original_query)
@@ -161,6 +172,6 @@ def _parse_rewrite_output(raw: str, original_query: str) -> Dict[str, str]:
 def _fallback(query: str) -> Dict[str, str]:
     has_arabic = bool(re.search(r"[\u0600-\u06FF]", query))
     return {
-        "rewritten_query": query,
+        "rewritten_queries": [query],
         "detected_language": "Arabic" if has_arabic else "English",
     }

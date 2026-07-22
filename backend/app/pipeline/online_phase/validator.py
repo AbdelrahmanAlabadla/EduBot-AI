@@ -31,6 +31,11 @@ def validate_and_repair(
     school_id: Optional[UUID] = None,
     db: Optional[Any] = None,
 ) -> Tuple[str, bool]:
+    max_rerank = max((c.get("rerank_score", 0) for c in context_chunks), default=0)
+    if max_rerank < 0.30:
+        logger.warning("Validation: max rerank score %.4f < 0.30 — abstaining", max_rerank)
+        return _fallback_answer(detected_language, school_id, db), False
+
     tier1_passed, tier1_retry_prompt = _tier1_citation_check(answer, allowed_citation_ids)
     if not tier1_passed:
         logger.warning("Tier 1 (citation check) FAILED — attempting targeted retry")

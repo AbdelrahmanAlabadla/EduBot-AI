@@ -111,9 +111,19 @@ def build_index():
 
 def answer(client, parent_map: dict, q: str, history: list) -> dict:
     rw = rewrite_query(q, history[-4:])
-    rewritten, lang = rw["rewritten_query"], rw["detected_language"]
-    print(f"  [LLM rewrite] lang={lang}, query=\"{rewritten}\"", flush=True)
-    raw = rrf_search(client, COLLECTION, rewritten)
+    rewritten_queries = rw["rewritten_queries"]
+    lang = rw["detected_language"]
+    print(f"  [LLM rewrite] lang={lang}, {len(rewritten_queries)} queries: {rewritten_queries}", flush=True)
+
+    all_raw = {}
+    for i, query in enumerate(rewritten_queries):
+        chunks = rrf_search(client, COLLECTION, query)
+        for c in chunks:
+            cid = str(c.get("id"))
+            if cid and cid not in all_raw:
+                all_raw[cid] = c
+    raw = sorted(all_raw.values(), key=lambda x: x.get("score", 0), reverse=True)[:settings.RAG_RRF_LIMIT]
+    rewritten = rewritten_queries[0]
     print(f"\n  [debug] Retrieved {len(raw)} chunks, top RRF score={raw[0]['score']:.4f}" if raw else f"\n  [debug] No chunks retrieved", flush=True)
     if not initial_judge(raw, rewritten):
         uni = settings.UNIVERSITY_NAME or "the university"
